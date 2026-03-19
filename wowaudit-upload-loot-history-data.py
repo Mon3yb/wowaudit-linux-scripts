@@ -39,9 +39,7 @@ def extract_loot_history_table(lua_file: file) -> dict:
         raise Exception("Could not find `RCLootCouncilLootDB = { ... }` in the Lua file.")
     else:
         try:
-            decoded_lua = lua.decode(data.group(1))
-            json_data = {"_json": [decoded_lua]}
-
+            json_data = lua.decode(data.group(1)) #decode into json
         except:
             subprocess.run([
                 "notify-send",
@@ -52,6 +50,67 @@ def extract_loot_history_table(lua_file: file) -> dict:
             ], check=False)
             raise Exception(f"Could not decode lua to json")
         return json_data
+
+def process_history_item(
+    character_name: str,
+    item_table: dict,
+    forced: bool):
+
+    loot_history_item = {}
+        try:
+            date = item_table['date']
+            time = item_table['time']
+            datetime = f"{date} {time}" #<----- TODO: Need to check for "%d/%m/%y %H:%M:%S" or "%Y/%m/%d %H:%M:%S" and needs to be string
+
+            seconds_since_epoch = #UTC.now as timestamp <----- TODO
+            three_months_ago = #UTC.now - 90 days as timestamp <----- TODO
+
+            # Check if data is older than 3 months and return nothing if it is
+            if not forced and (three_months_ago >= seconds_since_epoch):
+                return
+
+            #TODO: process values and check for none. Maybe use dict.get('data') instead of json['data'] for better handling e.g. "dict.get('data') or None"
+            rclootcouncil_id = item_table['id']
+            recipient = character_name
+            master_looter item_table['owner']
+            difficulty_id = item_table['difficultyID']
+            response = item_table['response']
+            rgba = f"{item_table[0]*255}, {item_table[1]*255}, {item_table[2]*255}, {item_table[3]}"  #<----- NOTE: Needs to be in format of "r,g,b,a". each color from 0-255 and a = 0.0-1.0 in decimals
+            awarded_at = datetime
+            game_string = item_table['lootWon']
+            note = item_table['note'] #<----- NOTE: Need to "None" empty string if nothing
+            old_item_1_game_string = item_table[itemReplaced1] #<----- NOTE: Need to "None" if nothing
+            old_item_2_game_string = item_table[itemReplaced2] #<----- NOTE: Need to "None" if nothing
+            same_response_amount = item_table[same_response_amount] #<----- NOTE: Need to "None" if nothing
+            wishes_when_awarded = item_table['wishes'] #<----- NOTE: Need to "None" if nothing
+
+            loot_history_item =(
+                f"""rclootcouncil_id" = {rclootcouncil_id}\n""",
+                f"""recipient": {recipient}""",
+                f"""master_looter": {master_looter}""",
+                f"""difficulty_id": {int(difficulty_id)}""",
+                f"""response": {response}"""
+                f"""response_color: {rgba}""",
+                f"""awarded_at": {awarded_at}""",
+                f"""game_string": {game_string}""",
+                f"""note": {note}""",
+                f"""old_item_1_game_string": {old_item_1_game_string}""",
+                f"""old_item_2_game_string": {old_item_2_game_string}""",
+                f"""same_response_amount": {same_response_amount}""",
+                f"""wishes_when_awarded": {wishes_when_awarded}"""
+            )
+            return loot_history_item
+        except:
+            subprocess.run([
+                "notify-send",
+                "-u","critical",
+                "-a", "WoWAudit Guild data script",
+                "Error in item parsing",
+                "Could not parse item in history table",
+            ], check=False)
+            raise Exception(f"Could not parse item in history table")
+
+
 
 def upload_loot_history_data(api_uri: str, api_token: str, data: dict) -> requests.Response:
     headers = {
@@ -87,39 +146,72 @@ def upload_loot_history_data(api_uri: str, api_token: str, data: dict) -> reques
 ###########################################################
 # NOTES
 
+#fn process_history_item(
+#        &self,
+#        character_name: String,
+#        item_table: LuaTable,
+#        forced: bool,
+#    ) -> Result<LootHistoryItem, Box<dyn std::error::Error>> {
+#        let date: String = item_table.get("date")?;
+#        let time: String = item_table.get("time")?;
+#        let datetime =
+#            NaiveDateTime::parse_from_str(&format!("{} {}", date, time), "%d/%m/%y %H:%M:%S")
+#                .or_else(|_| NaiveDateTime::parse_from_str(&format!("{} {}", date, time), "%Y/%m/%d %H:%M:%S"))?;
+#        let seconds_since_epoch = datetime.and_utc().timestamp() as i32;
+#
+#        let three_months_ago = (Utc::now() - Duration::days(90)).timestamp() as i32;
+#        if !forced && three_months_ago >= seconds_since_epoch {
+#            return Err("Item is older than 3 months".into());
+#        }
+#
+#        let wishes: Result<LuaTable, LuaError> = item_table.get("wishes");
+#        let wish_json = match wishes {
+#            Ok(wishes) => Some(serde_json::to_string(&wishes)?),
+#            _ => None,
+#        };
+#
+#        let wow_color: LuaTable = item_table.get("color")?;
+#        let r: f32 = wow_color.get(1)?;
+#        let g: f32 = wow_color.get(2)?;
+#        let b: f32 = wow_color.get(3)?;
+#        let a: f32 = wow_color.get(4)?;
+#        let rgba = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a);
+#
+#        Ok(LootHistoryItem {
+#            rclootcouncil_id: item_table.get("id")?,
+#            recipient: character_name,
+#            master_looter: item_table.get("owner")?,
+#            difficulty_id: item_table.get("difficultyID")?,
+#            response: item_table.get("response")?,
+#            response_color: rgba,
+#            game_string: item_table.get("lootWon")?,
+#            note: item_table.get("note").unwrap_or("".to_string()),
+#            awarded_at: datetime.to_string(),
+#            old_item_1_game_string: item_table.get("itemReplaced1").unwrap_or(None),
+#            old_item_2_game_string: item_table.get("itemReplaced2").unwrap_or(None),
+#            wishes_when_awarded: wish_json,
+#            same_response_amount: item_table.get("same_response_amount").unwrap_or(None),
+#        })
+#    }
+
 # Upload structure
 #{ "_json":
 #    [
 #        "rclootcoundil_id" = "String",
 #        "recipient": "String",
 #        "master_looter": "String",
-#        "difficulty_id": int (14=normal, 15=heroic, 16=mythic, 17=raidfinder),
+#        "difficulty_id": int,
 #        "response": "String"
-#        "response_color:" (u8, u8, u8, f32),
+#        "response_color:" "String(r(255), g(255), b(255), a(0.0-1))",
 #        "awarded_at": "String",
-#        "game_strin": "String",
+#        "game_string": "String",
 #        "note": "String",
-#        "old_item_1_game_string": "OptionString",
-#        "old_item_2_game_string": "OptionString",
-#        "same_response_amount": "OptionInt32",
-#        "wishes_when_awarded": "OptionString"
+#        "old_item_1_game_string": "String",
+#        "old_item_2_game_string": "String",
+#        "same_response_amount": int,
+#        "wishes_when_awarded": "String"
 #    ]
 #}
-
-# Json values?
-#"rclootcouncil_id" = ???
-#"recipient" = "Player": [] <-- json array with everything for that player
-#"master_looter": ??? maybe Player['owner']
-#"difficulty_id": Player['difficultyID']
-#"response": Player['response']
-#"response_color": Player['color']
-#"awarded_at": Player['time']
-#"game_string": Player['lootWon']
-#"note": Player['note']
-#"old_item_1_game_string": Player['itemReplaced1']
-#"old_item_2_game_string": Player['itemReplaced2']
-#"same_response_amount": Player['same_response_amount']
-#"wishes_when_awarded": Player['wishes']
 
 # History data structure
 # "Zelarn-Blackhand": [
