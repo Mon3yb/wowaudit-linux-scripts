@@ -1,78 +1,163 @@
-import json
+from __future__ import annotations
+
 import re
 import subprocess
-import requests
+from dataclasses import dataclass
 from pathlib import Path
-from slpp import slpp as lua #lua parser
+from typing import Any
+
+import requests
+from slpp import slpp as lua
 
 ###########################################################
 ### Variables to change
 
-wow_path = "" #Path to the _retail_ folder e.g "/home/mon3y/Faugus/battlenet/drive_c/Program Files (x86)/World of Warcraft/_retail_/"
-account_name = "" #Account name as written in "WTF/Account" e.g. ""/home/mon3y/Faugus/battlenet/drive_c/Program Files (x86)/World of Warcraft/_retail_/WTF/Account/MON3Y" = "MON3Y"
-wow_audit_api_token = "" #Your API token from WoWAudit. Get it from the website (https://wowaudit.com) in the API menu under Credentials
+wow_path = ""  # Path to the _retail_ folder
+account_name = ""  # Account name as written in WTF/Account
+wow_audit_api_token = ""  # Your API token from WoWAudit
 
 ###########################################################
-### More variables, normaly you don't need to change these
+### More variables, normally you don't need to change these
 
-api_uri = "https://wowaudit.com/v1/game_data"
-companion_data_path = Path(f"{wow_path}/WTF/Account/{account_name}/SavedVariables/WowauditCompanion.lua")
+API_URI = "https://wowaudit.com/v1/game_data"
+APP_NAME = "WoWAudit Guild data script"
+REQUEST_TIMEOUT_SECONDS = 30
 
-###########################################################
-# Functions
 
-def extract_wowaudit_table(lua_file: file) -> dict:
-    with open(lua_file, "r") as f:
-        text = f.read()
+class WowauditScriptError(RuntimeError):
+    """Raised when the guild upload script cannot complete successfully."""
 
-    data = re.search(r"\bWowauditDataSyncDB\s*=\s*({.*})\s*$", text, re.S)
 
-    if not data:
-        subprocess.run([
-            "notify-send",
-            "-u","critical",
-            "-a", "WoWAudit Guild data script",
-            "Error in parsing Lua",
-            "Could not find `WowauditDataSyncDB = { ... }` in the Lua file.",
-        ], check=False)
-        raise Exception("Could not find `WowauditDataSyncDB = { ... }` in the Lua file.")
-    else:
-        try:
-            decoded_lua = lua.decode(data.group(1))
-            json_data = {"_json": [decoded_lua]}
+@dataclass(frozen=True)
+class ScriptConfig:
+    wow_path: Path
+    api_token: str
+    account_name: str
 
-        except:
-            subprocess.run([
-                "notify-send",
-                "-u","critical",
-                "-a", "WoWAudit Guild data script",
-                "Error in parsing Lua",
-                "Could not decode lua to json",
-            ], check=False)
-            raise Exception(f"Could not decode lua to json")
-        return json_data
+    def require_wow_directory(self) -> Path:
+        if not self.wow_path.is_dir():
+            raise WowauditScriptError(
+                "No World of Warcraft instance found. "
+                "Please make sure you provided the correct path in the script."
+            )
+        return self.wow_path
 
-def upload_guilddata(api_uri: str, api_token: str, data: dict) -> requests.Response:
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Accept": "application/json",
-    }
+    def require_api_token(self) -> str:
+        if not self.api_token.strip():
+            raise WowauditScriptError(
+                "No WoWAudit API token configured. Please set `wow_audit_api_token` in the script."
+            )
+        return self.api_token
 
-    response = requests.post(api_uri, headers=headers, json=data, timeout=30)
+    def require_account_name(self) -> str:
+        if not self.account_name.strip():
+            raise WowauditScriptError(
+                "No account name configured. Please set `account_name` in the script."
+            )
+        return self.account_name
 
-    if response.status_code == 200:
-        return response
-    else:
-        subprocess.run([
-            "notify-send",
-            "-u","critical",
-            "-a", "WoWAudit Guild data script",
-            f"Error in uploading guild data to WoWAudit",
-            f"{response.status_code} {response.reason} {response.text[:200]}",
-        ], check=False)
-        response.raise_for_status()
 
-###########################################################
-# Main
-payload = extract_wowaudit_table(companion_data_path)
-upload_guilddata(api_uri, wow_audit_api_token, payload)
+
+def notify(summary: str, body: str, *, critical: bool = False) -> None:
+    command = ["notify-send"]
+    if critical:
+        command.extend(["-u", "critical"])
+    command.extend(["-a", APP_NAME, summary, body])
+    subprocess.run(command, check=False)
+
+
+
+def fail(summary: str, body: str) -> None:
+    notify(summary, body, critical=True)
+    raise WowauditScriptError(f"{summary}\n{body}")
+
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise WowauditScriptError(f"Required file not found: {path}") from exc
+
+
+
+def extract_lua_assignment(text: str, variable_name: str) -> str:
+    match = re.search(rf"\b{re.escape(variable_name)}\s*=\s*({{.*}})\s*$", text, re.S)
+    if not match:
+        raise WowauditScriptError(
+            f"Could not find `{variable_name} = {{ ... }}` in the Lua file."
+        )
+    return match.group(1)
+
+
+
+def post_json(url: str, *, api_token: str, payload: dict[str, Any], expected_statuses: set[int]) -> requests.Response:
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code not in expected_statuses:
+        raise WowauditScriptError(
+            f"HTTP request to {url} failed with "
+            f"{response.status_code} {response.reason}: {response.text[:200]}"
+        )
+    return response
+
+
+
+def companion_data_path(config: ScriptConfig) -> Path:
+    return (
+        config.wow_path
+        / "WTF"
+        / "Account"
+        / config.account_name
+        / "SavedVariables"
+        / "WowauditCompanion.lua"
+    )
+
+
+
+def extract_payload(lua_file: Path) -> dict[str, list[dict[str, Any]]]:
+    text = read_text(lua_file)
+    raw_assignment = extract_lua_assignment(text, "WowauditDataSyncDB")
+
+    try:
+        decoded_lua = lua.decode(raw_assignment)
+    except Exception as exc:
+        raise ValueError("Could not decode Lua payload to Python data.") from exc
+
+    if not isinstance(decoded_lua, dict):
+        raise ValueError("Expected WowauditDataSyncDB to decode to a dictionary.")
+
+    return {"_json": [decoded_lua]}
+
+
+
+def main() -> int:
+    try:
+        config = ScriptConfig(
+            wow_path=Path(wow_path).expanduser(),
+            api_token=wow_audit_api_token,
+            account_name=account_name,
+        )
+        config.require_wow_directory()
+        config.require_api_token()
+        config.require_account_name()
+
+        payload = extract_payload(companion_data_path(config))
+        post_json(API_URI, api_token=config.api_token, payload=payload, expected_statuses={200})
+
+        notify("Successfully ran process", "Guild data uploaded to WoWAudit")
+        print("Successfully ran process\nGuild data uploaded to WoWAudit")
+        return 0
+    except Exception as exc:
+        fail("Error in uploading guild data to WoWAudit", str(exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
