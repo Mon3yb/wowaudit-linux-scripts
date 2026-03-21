@@ -1,5 +1,6 @@
 # wowaudit-linux-scripts
 Helper scripts to run WoWAudit client operations on Linux
+Basically does the same as the WoWAudit client on Windows. You will need to configure your api token and your installation path in the script files.
 
 You can either run them manually with `python <script>` or add them as a systemd service
 
