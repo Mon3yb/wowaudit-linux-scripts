@@ -1,196 +1,238 @@
+from __future__ import annotations
+
 import json
 import re
 import subprocess
-import requests
-from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from slpp import slpp as lua #lua parser
+from pathlib import Path
+from typing import Any
+
+import requests
+from slpp import slpp as lua
 
 ###########################################################
 ### Variables to change
 
-wow_path = "" #Path to the _retail_ folder e.g "/home/mon3y/Faugus/battlenet/drive_c/Program Files (x86)/World of Warcraft/_retail_/"
-account_name = "" #Account name as written in "WTF/Account" e.g. ""/home/mon3y/Faugus/battlenet/drive_c/Program Files (x86)/World of Warcraft/_retail_/WTF/Account/MON3Y" = "MON3Y"
-wow_audit_api_token = "" #Your API token from WoWAudit. Get it from the website (https://wowaudit.com) in the API menu under Credentials
+wow_path = ""  # Path to the _retail_ folder
+account_name = ""  # Account name as written in WTF/Account
+wow_audit_api_token = ""  # Your API token from WoWAudit
 
 ###########################################################
-### More variables, normaly you don't need to change these
+### More variables, normally you don't need to change these
 
-api_uri = "https://wowaudit.com/v1/rclootcouncil"
-rclootcouncil_data_path = Path(f"{wow_path}/WTF/Account/{account_name}/SavedVariables/RCLootCouncil.lua")
+API_URI = "https://wowaudit.com/v1/rclootcouncil"
+APP_NAME = "WoWAudit loot history upload script"
+MAX_ITEM_AGE_DAYS = 90
+REQUEST_TIMEOUT_SECONDS = 30
 
-###########################################################
-# Functions
-def extract_loot_history_dict(lua_file: Path | str) -> dict:
-    '''
-    Extracting the loot history from RCLootCoundil.lua inside "RCLootCouncilLootDB = { ... }"
-    Convert it to a dict
-    '''
-    with open(lua_file, "r", encoding="utf-8") as f:
-        text = f.read()
 
-    rcl_loot_db = re.search(r"\bRCLootCouncilLootDB\s*=\s*({.*})\s*$", text, re.S) # Extract RCLootCouncilLootDB = { ... } from file
+class WowauditScriptError(RuntimeError):
+    """Raised when the loot history upload script cannot complete successfully."""
 
-    # Check if data is not empty
-    if not rcl_loot_db:
-        subprocess.run(
-            [
-                "notify-send",
-                "-u", "critical",
-                "-a", "WoWAudit Guild data script",
-                "Error in parsing Lua",
-                "Could not find `RCLootCouncilLootDB = { ... }` in the Lua file.",
-            ],
-            check=False,
+
+@dataclass(frozen=True)
+class ScriptConfig:
+    wow_path: Path
+    api_token: str
+    account_name: str
+
+    def require_wow_directory(self) -> Path:
+        if not self.wow_path.is_dir():
+            raise WowauditScriptError(
+                "No World of Warcraft instance found. "
+                "Please make sure you provided the correct path in the script."
+            )
+        return self.wow_path
+
+    def require_api_token(self) -> str:
+        if not self.api_token.strip():
+            raise WowauditScriptError(
+                "No WoWAudit API token configured. Please set `wow_audit_api_token` in the script."
+            )
+        return self.api_token
+
+    def require_account_name(self) -> str:
+        if not self.account_name.strip():
+            raise WowauditScriptError(
+                "No account name configured. Please set `account_name` in the script."
+            )
+        return self.account_name
+
+
+
+def notify(summary: str, body: str, *, critical: bool = False) -> None:
+    command = ["notify-send"]
+    if critical:
+        command.extend(["-u", "critical"])
+    command.extend(["-a", APP_NAME, summary, body])
+    subprocess.run(command, check=False)
+
+
+
+def fail(summary: str, body: str) -> None:
+    notify(summary, body, critical=True)
+    raise WowauditScriptError(f"{summary}\n{body}")
+
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise WowauditScriptError(f"Required file not found: {path}") from exc
+
+
+
+def extract_lua_assignment(text: str, variable_name: str) -> str:
+    match = re.search(rf"\b{re.escape(variable_name)}\s*=\s*({{.*}})\s*$", text, re.S)
+    if not match:
+        raise WowauditScriptError(
+            f"Could not find `{variable_name} = {{ ... }}` in the Lua file."
         )
-        raise ValueError("Could not find `RCLootCouncilLootDB = { ... }` in the Lua file.")
+    return match.group(1)
+
+
+
+def dump_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+
+def post_json(url: str, *, api_token: str, payload: dict[str, Any], expected_statuses: set[int]) -> requests.Response:
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Accept": "application/json",
+        },
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code not in expected_statuses:
+        raise WowauditScriptError(
+            f"HTTP request to {url} failed with "
+            f"{response.status_code} {response.reason}: {response.text[:200]}"
+        )
+    return response
+
+
+
+def loot_data_path(config: ScriptConfig) -> Path:
+    return (
+        config.wow_path
+        / "WTF"
+        / "Account"
+        / config.account_name
+        / "SavedVariables"
+        / "RCLootCouncil.lua"
+    )
+
+
+
+def extract_loot_history(lua_file: Path) -> dict[str, list[dict[str, Any]]]:
+    text = read_text(lua_file)
+    raw_assignment = extract_lua_assignment(text, "RCLootCouncilLootDB")
 
     try:
-        rcl_db_data = rcl_loot_db.group(1)
-        rcl_db_dict = lua.decode(rcl_db_data)
-        rcl_db_factionrealm = rcl_db_dict.get("factionrealm")
-        rcl_loot_history = next(iter(rcl_db_factionrealm.values()))
-        return rcl_loot_history
-    except Exception as e:
-        subprocess.run(
-            [
-                "notify-send",
-                "-u", "critical",
-                "-a", "WoWAudit Guild data script",
-                "Error in parsing Lua",
-                "Could not decode lua to dict",
-            ],
-            check=False,
-        )
-        raise ValueError(f"Could not decode lua to dict: {e}") from e
+        decoded_lua = lua.decode(raw_assignment)
+        factionrealm = decoded_lua.get("factionrealm")
+        if not isinstance(factionrealm, dict) or not factionrealm:
+            raise ValueError("Missing factionrealm data in RCLootCouncilLootDB.")
+        loot_history = next(iter(factionrealm.values()))
+    except Exception as exc:
+        raise ValueError("Could not decode RCLootCouncil loot history.") from exc
+
+    if not isinstance(loot_history, dict):
+        raise ValueError("Expected loot history to decode to a dictionary keyed by character name.")
+
+    return loot_history
 
 
-def parse_date_time(date_string: str, time_string: str) -> datetime:
+
+def parse_awarded_at(date_string: str, time_string: str) -> datetime:
     datetime_string = f"{date_string} {time_string}"
-    valid_datetime_formats = [
-        "%d/%m/%y %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-    ]
-
-    for datetime_format in valid_datetime_formats:
+    for pattern in ("%d/%m/%y %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
         try:
-            return datetime.strptime(datetime_string, datetime_format)
+            return datetime.strptime(datetime_string, pattern)
         except ValueError:
-            pass
+            continue
 
     raise ValueError(
-        f'Invalid date or time format in loot history\n'
-        f'Expected {valid_datetime_formats[0]} or {valid_datetime_formats[1]} '
-        f'but got "{datetime_string}"'
+        f"Invalid date/time format in loot history: {datetime_string}. "
+        "Expected DD/MM/YY HH:MM:SS or YYYY/MM/DD HH:MM:SS."
     )
 
 
-def process_history_item(character_name: str, item_table: dict, forced: bool) -> dict | None:
-    try:
-        date_string = item_table["date"]
-        time_string = item_table["time"]
-        datetime_string = f"{date_string} {time_string}"
-        datetime_date = parse_date_time(date_string, time_string)
-        three_months_ago = datetime.now() - timedelta(days=90)
 
-        if not forced and datetime_date <= three_months_ago:
-            print("Item data older than 90 days. Skipping to next one")
-            return None
-
-        color = item_table.get("color", [0, 0, 0, 1])
-        rgba = f"{int(color[0] * 255)},{int(color[1] * 255)},{int(color[2] * 255)},{color[3]}"
-
-        return {
-            "rclootcouncil_id": item_table["id"],
-            "recipient": character_name,
-            "master_looter": item_table["owner"],
-            "difficulty_id": int(item_table["difficultyID"]),
-            "response": item_table["response"],
-            "response_color": rgba,
-            "awarded_at": datetime_string,
-            "game_string": item_table["lootWon"],
-            "note": item_table.get("note") or "",
-            "old_item_1_game_string": item_table.get("itemReplaced1"),
-            "old_item_2_game_string": item_table.get("itemReplaced2"),
-            "same_response_amount": item_table.get("same_response_amount") or 0,
-            "wishes_when_awarded": json.dumps(item_table.get("wishes"), ensure_ascii=False),
-        }
-
-    except Exception as e:
-        subprocess.run(
-            [
-                "notify-send",
-                "-u", "critical",
-                "-a", "WoWAudit Guild data script",
-                "Error in item parsing",
-                "Could not parse item in history table",
-            ],
-            check=False,
-        )
-        raise ValueError(f"Could not parse item in history table\n{e}") from e
+def normalize_color(color: Any) -> str:
+    if not isinstance(color, list) or len(color) != 4:
+        color = [0, 0, 0, 1]
+    red, green, blue, alpha = color
+    return f"{int(red * 255)},{int(green * 255)},{int(blue * 255)},{alpha}"
 
 
-def upload_loot_history_data(api_uri: str, api_token: str, data: dict) -> requests.Response:
-    """
-    HTTP POST request to upload loot history to the rclootcouncil endpoint.
-    """
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Accept": "application/json",
+
+def build_history_item(character_name: str, item_table: dict[str, Any], *, forced: bool) -> dict[str, Any] | None:
+    awarded_at = parse_awarded_at(item_table["date"], item_table["time"])
+    cutoff = datetime.now() - timedelta(days=MAX_ITEM_AGE_DAYS)
+    if not forced and awarded_at <= cutoff:
+        return None
+
+    return {
+        "rclootcouncil_id": item_table["id"],
+        "recipient": character_name,
+        "master_looter": item_table["owner"],
+        "difficulty_id": int(item_table["difficultyID"]),
+        "response": item_table["response"],
+        "response_color": normalize_color(item_table.get("color")),
+        "awarded_at": f"{item_table['date']} {item_table['time']}",
+        "game_string": item_table["lootWon"],
+        "note": item_table.get("note") or "",
+        "old_item_1_game_string": item_table.get("itemReplaced1"),
+        "old_item_2_game_string": item_table.get("itemReplaced2"),
+        "same_response_amount": item_table.get("same_response_amount") or 0,
+        "wishes_when_awarded": dump_json(item_table.get("wishes")),
     }
 
-    response = requests.post(api_uri, headers=headers, json=data, timeout=30)
 
-    if response.status_code == 204:
-        return response
 
-    subprocess.run(
-        [
-            "notify-send",
-            "-u", "critical",
-            "-a", "WoWAudit loot history upload script",
-            "Error in uploading loot history to WoWAudit",
-            f"{response.status_code} {response.reason} {response.text[:200]}",
-        ],
-        check=False,
-    )
-    response.raise_for_status()
-
-###########################################################
-## Main
-try:
-    loot_history = extract_loot_history_dict(rclootcouncil_data_path)
-
-    payload = {"_json": []}
+def build_payload(loot_history: dict[str, list[dict[str, Any]]], *, forced: bool = False) -> dict[str, list[dict[str, Any]]]:
+    items: list[dict[str, Any]] = []
     for character_name, character_loot in loot_history.items():
-        for item in character_loot:
-            history_item = process_history_item(character_name, item, False)
+        if not isinstance(character_loot, list):
+            raise ValueError(f"Expected loot history list for character {character_name!r}.")
+        for item_table in character_loot:
+            if not isinstance(item_table, dict):
+                raise ValueError(f"Unexpected loot history entry for character {character_name!r}.")
+            history_item = build_history_item(character_name, item_table, forced=forced)
             if history_item is not None:
-                payload["_json"].append(history_item)
-
-    upload_loot_history_data(api_uri, wow_audit_api_token, payload)
-
-    subprocess.run(
-        [
-            "notify-send",
-            "-a", "WoWAudit loot history upload",
-            "Successfully ran process",
-            "Loot history uploaded to WoWAudit",
-        ],
-        check=False,
-    )
-    print("Successfully ran process\nLoot history uploaded to WoWAudit")
-except Exception as e:
-    subprocess.run(
-        [
-            "notify-send",
-            "-u", "critical",
-            "-a", "WoWAudit loot history upload script",
-            "Error in uploading loot history to WoWAudit",
-            str(e),
-        ],
-        check=False,
-    )
-    raise
+                items.append(history_item)
+    return {"_json": items}
 
 
+
+def main() -> int:
+    try:
+        config = ScriptConfig(
+            wow_path=Path(wow_path).expanduser(),
+            api_token=wow_audit_api_token,
+            account_name=account_name,
+        )
+        config.require_wow_directory()
+        config.require_api_token()
+        config.require_account_name()
+
+        loot_history = extract_loot_history(loot_data_path(config))
+        payload = build_payload(loot_history)
+        post_json(API_URI, api_token=config.api_token, payload=payload, expected_statuses={204})
+
+        notify("Successfully ran process", "Loot history uploaded to WoWAudit")
+        print("Successfully ran process\nLoot history uploaded to WoWAudit")
+        return 0
+    except Exception as exc:
+        fail("Error in uploading loot history to WoWAudit", str(exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
